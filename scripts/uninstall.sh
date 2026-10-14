@@ -1,15 +1,16 @@
 #!/bin/bash
 # Reverse install.sh. Quits the app, takes the recovery lock, runs the current
 # backstop with --force under that same lock, verifies for itself that the
-# journal is clean, and only then removes the LaunchAgent, the sudoers rule,
-# the app bundle, and the journal. Keeps config.json and the logs unless
-# --purge. Everything after the quit happens while this process holds
-# APP_SUPPORT/.recovery.lock, so neither a queued periodic backstop nor a
-# relaunched app can republish the journal while it is being removed.
+# journal is clean, and only then removes the LaunchAgent, the app bundle, and
+# the journal. Never touches sudoers: the pmset rule is managed outside Insomnia.
+# Keeps config.json and the logs unless --purge. Everything after the quit
+# happens while this process holds APP_SUPPORT/.recovery.lock, so neither a
+# queued periodic backstop nor a relaunched app can republish the journal
+# while it is being removed.
 #
 # If anything Insomnia changed is still journaled, nothing is removed: the
-# LaunchAgent keeps retrying every minute, the sudoers rule keeps pmset
-# undoable, and state.json keeps the evidence. The message says what to do.
+# LaunchAgent keeps retrying every minute and state.json keeps the evidence.
+# The message says what to do.
 #
 # Deletion is by exact owned file, never by directory tree: --purge removes
 # the files Insomnia writes (see Paths.swift) and then rmdir's its own
@@ -35,14 +36,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PGREP=/usr/bin/pgrep
 OSASCRIPT=/usr/bin/osascript
 LAUNCHCTL=/bin/launchctl
-SUDO=/usr/bin/sudo
 PLUTIL=/usr/bin/plutil
 LOCKF=/usr/bin/lockf
 LOCK_TIMEOUT_SECONDS=10
 # How long to wait for the app to exit after asking it to quit.
 QUIT_WAIT_SECONDS=10
 APP="$HOME/Applications/Insomnia.app"
-SUDOERS=/etc/sudoers.d/insomnia
 
 if [[ -n "${INSOMNIA_HOME:-}" ]]; then
   APP_SUPPORT="$INSOMNIA_HOME"
@@ -184,15 +183,15 @@ MSG
   cat >&2 <<MSG
 
 Nothing was removed on purpose: the LaunchAgent keeps retrying every minute,
-the sudoers rule keeps pmset undoable, and the journal keeps the evidence.
+and the journal keeps the evidence.
 
 What to do, then rerun this script:
   - Saved audio (volume/mute), display brightness or keyboard backlight:
     open Insomnia.app; it restores them from the journal at launch. If the
     display is dark, press the brightness-up key first.
-  - pmset failures (sleep / Low Power Mode): check $SUDOERS
-    (rerun scripts/install.sh to reinstall it), or run
-    'sudo pmset -a disablesleep 0' / 'sudo pmset -b lowpowermode 0' yourself.
+  - pmset failures (sleep): make sure the NOPASSWD sudoers rule for pmset
+    is active (some are only active while you are elevated to admin), or
+    run 'sudo pmset -a disablesleep 0' yourself.
   - Frozen or legacy pids: open Insomnia.app to resolve them, or inspect each
     with 'ps -o pid,stat,lstart,command -p <pid>' and 'kill -CONT <pid>' it
     yourself if it is a process you recognise.
@@ -293,11 +292,6 @@ if (( print_rc != 113 )); then
   exit 1
 fi
 rm -f "$PLIST"
-
-step "Removing $SUDOERS (requires your password)"
-if [[ -e "$SUDOERS" ]] || "$SUDO" test -e "$SUDOERS"; then
-  "$SUDO" rm -f "$SUDOERS"
-fi
 
 step "Removing app bundle"
 rm -rf "$APP"

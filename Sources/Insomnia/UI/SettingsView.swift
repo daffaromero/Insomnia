@@ -146,9 +146,9 @@ struct SettingsView: View {
                 .foregroundStyle(.secondary)
             Toggle("Pause Docker Desktop when no containers are running", isOn: bind(\.dockerRule))
             Toggle("Mute audio on lid close", isOn: bind(\.muteOnLidClose))
+            // This build: Low Power Mode is never enabled (no sudoers rule).
             Toggle("Low Power Mode while the lid is closed", isOn: bind(\.lowPowerOnLidClose))
-                // A floor input: apply it now if the lid is already closed.
-                .onChange(of: manager.config.lowPowerOnLidClose) { manager.services?.reevaluateFloors() }
+                .disabled(true)
         } header: {
             Text("Lid-close actions")
         } footer: {
@@ -187,10 +187,11 @@ struct SettingsView: View {
             Stepper(value: bind(\.lowPowerFloor), in: 0...100, step: 5) {
                 LabeledContent("Low Power Mode below", value: "\(manager.config.lowPowerFloor)%")
             }
+            .disabled(true)
             Stepper(value: bind(\.endFloor), in: 0...100, step: 5) {
                 LabeledContent("End session below", value: "\(manager.config.endFloor)%")
             }
-            Toggle("Thermal rules (Low Power Mode when hot, end when critical)", isOn: bind(\.thermalRules))
+            Toggle("Thermal rules (end when critical)", isOn: bind(\.thermalRules))
         }
     }
 

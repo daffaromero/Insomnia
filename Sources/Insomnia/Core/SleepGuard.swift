@@ -1,7 +1,8 @@
 import Foundation
 
-/// The only two things Insomnia ever does as root, both through the four
-/// sudoers-allowed pmset commands written by install.sh.
+/// The only things Insomnia ever does as root, through pmset commands an
+/// existing sudoers rule allows (install.sh only verifies it; this build
+/// never enables Low Power Mode).
 protocol SleepGuarding: Sendable {
     func setSleepDisabled(_ disabled: Bool) async throws
     func isSleepDisabled() async throws -> Bool
@@ -21,13 +22,13 @@ struct SleepGuardError: Error, LocalizedError, Sendable {
         var msg = "`\(command)` failed with status \(status)"
         if !detail.isEmpty { msg += ": \(detail)" }
         if detail.contains("password") || detail.contains("sudo") {
-            msg += " (run scripts/install.sh to install /etc/sudoers.d/insomnia)"
+            msg += " (needs a NOPASSWD sudoers rule for /usr/bin/pmset -a disablesleep 0 and 1; scripts/install.sh checks it)"
         }
         return msg
     }
 }
 
-/// `sudo -n pmset …`. Never prompts; if the sudoers rule is missing the call
+/// `sudo -n pmset …`. Never prompts; if no sudoers rule allows it the call
 /// fails fast with a readable error instead of hanging on a password prompt.
 struct PmsetSleepGuard: SleepGuarding {
     static let sudo = "/usr/bin/sudo"

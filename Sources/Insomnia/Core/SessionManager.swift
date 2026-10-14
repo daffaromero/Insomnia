@@ -528,15 +528,10 @@ final class SessionManager {
         try persistState(s)
     }
 
-    /// Low Power Mode with journaling: the flag is written before `pmset -b
-    /// lowpowermode 1` and cleared only after `... 0` succeeds. Returns true
-    /// when the mode was actually changed by Insomnia.
-    ///
-    /// A mode the user already had on is never taken over: it would be
-    /// switched off at session end. If pmset cannot be read, no ownership
-    /// is taken either. If `lowpowermode 1` fails or times out, the mode may
-    /// still have been applied: the flag stays journaled until `lowpowermode
-    /// 0` is confirmed.
+    /// Low Power Mode. Enabling is a no-op that returns false (see
+    /// performSetLowPower). Disabling only acts on a flag journaled by an
+    /// older build, and clears it only after `pmset -b lowpowermode 0`
+    /// succeeds. Returns true when the mode was actually changed by Insomnia.
     @discardableResult
     func setLowPower(_ on: Bool) async -> Bool {
         let ticket = endTicket
@@ -548,53 +543,11 @@ final class SessionManager {
 
     private func performSetLowPower(_ on: Bool, ticket: Int) async -> Bool {
         if on {
-            guard !state.lowPowerSetByUs, endTicket == ticket else { return false }
-            do {
-                if try await sleepGuard.isLowPowerModeOn() {
-                    Log.info("low power mode already on; leaving it alone")
-                    return false
-                }
-            } catch {
-                Log.error("could not read low power mode; not enabling it: \(error.localizedDescription)")
-                return false
-            }
-            guard endTicket == ticket else { return false }
-            willEnableLowPower?()
-            if state.displayRestoredUnderLowPower != nil {
-                Log.info("display restore after low power mode dropped: a new low power mode interval starts")
-            }
-            do {
-                // One write: a write owed from an earlier interval (its
-                // clear failed) must not be found by this interval's end.
-                try journal { s in
-                    s.lowPowerSetByUs = true
-                    s.displayRestoredUnderLowPower = nil
-                }
-            } catch {
-                Log.error("could not journal low power mode: \(error.localizedDescription)")
-                return false
-            }
-            do {
-                try await sleepGuard.setLowPowerMode(true)
-            } catch {
-                fail("could not enable low power mode: \(error.localizedDescription)")
-                do {
-                    try await sleepGuard.setLowPowerMode(false)
-                    try? journal { $0.lowPowerSetByUs = false }
-                } catch {
-                    fail("low power mode may be on and could not be switched off: \(error.localizedDescription); kept in the journal to retry")
-                    do { try await backstop.arm() } catch { Log.error("recovery agent could not be confirmed: \(error.localizedDescription)") }
-                }
-                return false
-            }
-            guard endTicket == ticket else {
-                // The mode is on and journaled as ours; the end queued behind
-                // this call clears it. Nothing to announce.
-                Log.info("low power mode on, but an end was requested meanwhile; journal left for it")
-                return false
-            }
-            Log.info("low power mode on")
-            return true
+            // This build: no sudoers rule allows `pmset -b lowpowermode`, so
+            // Low Power Mode is never enabled and ownership is never journaled
+            // (a failed enable would leave lowPowerSetByUs set for the
+            // backstop to retry forever).
+            return false
         } else {
             guard state.lowPowerSetByUs else { return false }
             dropDisplayWriteIfMoved()

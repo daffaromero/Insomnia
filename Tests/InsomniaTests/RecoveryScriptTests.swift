@@ -7,7 +7,7 @@ import XCTest
 /// Each test runs a private COPY of the production script against a
 /// throwaway INSOMNIA_HOME. The copy has its fixed tool-path constants
 /// (sudo, pmset, ps, kill, sysctl, pgrep, pkill, osascript, launchctl) and
-/// its app-bundle / sudoers paths rewritten to point inside the fixture, so
+/// its app-bundle paths rewritten to point inside the fixture, so
 /// nothing privileged runs, no real process is signaled, and no real home,
 /// LaunchAgent, sudoers file, or installed app is read or written. plutil,
 /// lockf, and date are the real tools. The fakes record every call.
@@ -357,7 +357,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(calls.contains { $0.hasPrefix("sudo rm") }, "\(calls)")
         XCTAssertTrue(r.stderr.contains("BEFORE removing anything"), r.stderr)
         XCTAssertTrue(r.stderr.contains("sleepDisabledByUs is still true"), r.stderr)
-        XCTAssertTrue(r.stderr.contains(fx.sudoers.path), r.stderr)
+        XCTAssertTrue(r.stderr.contains("NOPASSWD sudoers rule for pmset"), r.stderr)
     }
 
     func testUninstallAbortsOnSavedAudioAndExplainsReopeningTheApp() throws {
@@ -447,9 +447,9 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
         XCTAssertTrue(fx.calls().contains("sudo -n \(fx.fakePmset) -a disablesleep 0"), "\(fx.calls())")
         XCTAssertTrue(fx.calls().contains("launchctl bootout gui/\(fx.uid) \(fx.plist.path)"), "\(fx.calls())")
-        XCTAssertTrue(fx.calls().contains("sudo rm -f \(fx.sudoers.path)"), "\(fx.calls())")
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("sudo rm") || $0.hasPrefix("sudo test") }, "\(fx.calls())")
         XCTAssertFalse(fx.exists(fx.plist))
-        XCTAssertFalse(fx.exists(fx.sudoers))
+        XCTAssertTrue(fx.exists(fx.sudoers), "the existing sudoers rule is never touched")
         XCTAssertFalse(fx.exists(fx.app))
         XCTAssertFalse(fx.exists(fx.state))
         XCTAssertFalse(fx.exists(fx.session))
@@ -849,7 +849,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(fx.exists(fx.logFile))
         XCTAssertFalse(fx.exists(fx.plist))
         XCTAssertFalse(fx.exists(fx.app))
-        XCTAssertFalse(fx.exists(fx.sudoers))
+        XCTAssertTrue(fx.exists(fx.sudoers), "the existing sudoers rule is never touched")
         XCTAssertTrue(r.stdout.contains("Kept \(fx.lock.path)"), r.stdout)
     }
 
@@ -1254,34 +1254,9 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try fx.contents(of: launchAgents), ["com.insomnia.backstop.plist"], "staging directory not removed")
     }
 
-    /// The password prompt (visudo + install of the sudoers rule) comes
-    /// before the running app is asked to quit and before the bundle, the
-    /// installed backstop.sh or the LaunchAgent are touched: a failed or
-    /// refused authentication leaves the previous install exactly as it was
-    /// and the app running.
-    func testInstallStopsBeforeQuittingOrReplacingAnythingWhenSudoAuthFails() throws {
-        try fx.prepareInstall()
-        try fx.installMachinery()
-        try "old helper".write(to: fx.installedBackstop, atomically: true, encoding: .utf8)
-        fx.setMode("pgrep", "0\n")          // the app is running the whole time
-        fx.setMode("sudo", "auth-fail")     // wrong password / no sudo rights
-
-        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
-
-        XCTAssertNotEqual(r.status, 0, r.stdout)
-        let calls = fx.calls()
-        XCTAssertFalse(calls.contains { $0.hasPrefix("osascript") }, "the app was asked to quit before authentication: \(calls)")
-        XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
-        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo install") }, "\(calls)")
-        XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary", "old bundle replaced")
-        XCTAssertEqual(try String(contentsOf: fx.installedBackstop, encoding: .utf8), "old helper", "installed backstop.sh replaced")
-        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist", "trusted plist touched")
-        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule", "sudoers rule replaced")
-        XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
-    }
-
-    /// Authentication passes but the rule it installed does not grant the
-    /// pmset commands: still nothing of the previous install is replaced.
+    /// No sudoers file is written. When `sudo -n -l` says the existing rule
+    /// does not grant pmset (missing or inactive), the install stops before
+    /// the running app is asked to quit and nothing is replaced.
     func testInstallStopsBeforeReplacingAnythingWhenSudoersRuleIsNotEffective() throws {
         try fx.prepareInstall()
         try fx.installMachinery()
@@ -1298,39 +1273,15 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary")
         XCTAssertEqual(try String(contentsOf: fx.installedBackstop, encoding: .utf8), "old helper")
         XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist")
-        XCTAssertTrue(r.stderr.contains("still not permitted"), r.stderr)
-    }
-
-    /// With no app running there is nothing to wait for: an installer that
-    /// assembled the bundle and copied backstop.sh before asking for the
-    /// password would reach the overwrite path here. Authentication must
-    /// still be the first thing attempted, and its failure must leave the
-    /// old bundle, helper and plist byte for byte as they were.
-    func testInstallWithNoAppRunningStopsBeforeReplacingAnythingWhenSudoAuthFails() throws {
-        try fx.prepareInstall()
-        try fx.installMachinery()
-        try "old helper".write(to: fx.installedBackstop, atomically: true, encoding: .utf8)
-        // pgrep default: not running at any check
-        fx.setMode("sudo", "auth-fail")
-
-        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
-
-        XCTAssertNotEqual(r.status, 0, r.stdout)
-        let calls = fx.calls()
-        XCTAssertTrue(calls.contains { $0.hasPrefix("sudo visudo") }, "authentication was attempted: \(calls)")
-        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo install") }, "\(calls)")
-        XCTAssertFalse(calls.contains { $0.hasPrefix("osascript") }, "nothing to quit: \(calls)")
-        XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
-        XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary", "old bundle replaced")
-        XCTAssertEqual(try String(contentsOf: fx.installedBackstop, encoding: .utf8), "old helper", "installed backstop.sh replaced")
-        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist", "trusted plist touched")
-        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule", "sudoers rule replaced")
+        XCTAssertTrue(calls.contains("sudo -n -l /usr/bin/pmset -a disablesleep 0"), "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo visudo") || $0.hasPrefix("sudo install") }, "no sudoers write: \(calls)")
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule", "sudoers touched")
+        XCTAssertTrue(r.stderr.contains("is not permitted"), r.stderr)
         XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
     }
 
-    /// Same with the app not running: authentication passes and the rule is
-    /// installed, but it does not grant pmset. The bundle, helper and plist
-    /// are still untouched.
+    /// Same with the app not running: the existing rule does not grant
+    /// pmset, so the bundle, helper and plist are still untouched.
     func testInstallWithNoAppRunningStopsBeforeReplacingAnythingWhenSudoersRuleIsNotEffective() throws {
         try fx.prepareInstall()
         try fx.installMachinery()
@@ -1342,21 +1293,22 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertNotEqual(r.status, 0, r.stdout)
         let calls = fx.calls()
-        XCTAssertTrue(calls.contains { $0.hasPrefix("sudo visudo") }, "authentication was attempted: \(calls)")
-        XCTAssertTrue(calls.contains { $0.hasPrefix("sudo install") }, "the rule was installed before being checked: \(calls)")
+        XCTAssertTrue(calls.contains("sudo -n -l /usr/bin/pmset -a disablesleep 0"), "the rule was checked: \(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo visudo") || $0.hasPrefix("sudo install") }, "no sudoers write: \(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("osascript") }, "nothing to quit: \(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
         XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary", "old bundle replaced")
         XCTAssertEqual(try String(contentsOf: fx.installedBackstop, encoding: .utf8), "old helper", "installed backstop.sh replaced")
         XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist", "trusted plist touched")
-        XCTAssertTrue(try String(contentsOf: fx.sudoers, encoding: .utf8).contains("NOPASSWD: /usr/bin/pmset"), "the new rule is what was installed")
-        XCTAssertTrue(r.stderr.contains("still not permitted"), r.stderr)
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule", "sudoers touched")
+        XCTAssertTrue(r.stderr.contains("is not permitted"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
     }
 
-    /// The sudoers rule is installed before the app is asked to quit. When
-    /// the app then keeps running, the refusal must say so: the rule is in
-    /// place, and only the bundle, backstop.sh and LaunchAgent are untouched.
-    func testInstallRefusalWhenAppKeepsRunningReportsSudoersInstalled() throws {
+    /// The sudoers rule is checked before the app is asked to quit. When the
+    /// app then keeps running, the refusal says the bundle, backstop.sh and
+    /// LaunchAgent are untouched; no sudoers file is ever written.
+    func testInstallRefusalWhenAppKeepsRunningTouchesNothing() throws {
         try fx.prepareInstall()
         try fx.installMachinery()
         try "old helper".write(to: fx.installedBackstop, atomically: true, encoding: .utf8)
@@ -1366,16 +1318,14 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
         let calls = fx.calls()
-        XCTAssertTrue(calls.contains { $0.hasPrefix("sudo install") }, "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo install") || $0.hasPrefix("sudo visudo") }, "\(calls)")
         XCTAssertTrue(calls.contains { $0.hasPrefix("osascript") }, "the app was asked to quit: \(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("pkill") }, "a refused quit stands: \(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
-        XCTAssertTrue(try String(contentsOf: fx.sudoers, encoding: .utf8).contains("NOPASSWD: /usr/bin/pmset"), "the rule was installed")
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule", "sudoers touched")
         XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary")
         XCTAssertEqual(try String(contentsOf: fx.installedBackstop, encoding: .utf8), "old helper")
         XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist")
-        XCTAssertFalse(r.stderr.contains("Nothing was changed"), "the sudoers rule was changed: \(r.stderr)")
-        XCTAssertTrue(r.stderr.contains(fx.sudoers.path), "says what was installed: \(r.stderr)")
         XCTAssertTrue(r.stderr.contains("not touched"), "says what was not: \(r.stderr)")
         XCTAssertTrue(r.stderr.contains("still running"), r.stderr)
     }
@@ -1404,8 +1354,9 @@ final class RecoveryScriptTests: XCTestCase {
             "codesign --verify --strict --deep \(fx.app.path)",
         ], "verified, never re-signed")
         let verify = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("codesign --verify") })
-        let password = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("sudo visudo") })
-        XCTAssertLessThan(verify, password, "the bundle is checked before the password prompt: \(calls)")
+        let sudoCheck = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("sudo -n -l") })
+        XCTAssertLessThan(verify, sudoCheck, "the bundle is checked before the sudo check: \(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo visudo") || $0.hasPrefix("sudo install") }, "no sudoers write: \(calls)")
         let source = try fx.files(under: prebuilt)
         let installed = try fx.files(under: fx.app)
         XCTAssertEqual(Set(installed.keys), Set(source.keys), "exactly the prebuilt files")
@@ -1416,7 +1367,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: fx.installedBackstop), try Data(contentsOf: fx.backstop),
                        "backstop.sh comes from the scripts folder beside install.sh")
         XCTAssertTrue(try String(contentsOf: fx.plist, encoding: .utf8).contains(fx.installedBackstop.path))
-        XCTAssertTrue(try String(contentsOf: fx.sudoers, encoding: .utf8).contains("NOPASSWD: /usr/bin/pmset"))
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule", "sudoers touched")
         XCTAssertTrue(r.stdout.contains("not rebuilt or re-signed"), r.stdout)
         XCTAssertTrue(r.stdout.contains("Installed"), r.stdout)
     }
@@ -1484,7 +1435,7 @@ final class RecoveryScriptTests: XCTestCase {
     }
 
     /// The installed copy is verified too. When it fails, the message says
-    /// what was already replaced: the sudoers rule, and the old app is gone.
+    /// what was already replaced: the old app is gone.
     func testInstallAppStopsWhenTheInstalledCopyFailsVerification() throws {
         let prebuilt = try fx.preparePrebuilt()
         try fx.installMachinery()
@@ -1499,7 +1450,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(calls.contains { $0.hasPrefix("codesign --force") }, "\(calls)")
         XCTAssertTrue(r.stderr.contains("The copy at \(fx.app.path)"), r.stderr)
         XCTAssertTrue(r.stderr.contains("already removed"), r.stderr)
-        XCTAssertTrue(r.stderr.contains("\(fx.sudoers.path) is installed"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("backstop.sh and the LaunchAgent were not touched"), r.stderr)
         XCTAssertFalse(r.stderr.contains("Nothing was changed"), r.stderr)
         XCTAssertEqual(try String(contentsOf: fx.installedBackstop, encoding: .utf8), "old helper")
         XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist")
@@ -1625,7 +1576,7 @@ final class RecoveryScriptTests: XCTestCase {
     }
 
     /// When the previous app cannot be fully removed, the install stops
-    /// there and says so: the sudoers rule is installed, what rm could not
+    /// there and says so: what rm could not
     /// remove is left in place, backstop.sh and the LaunchAgent are untouched.
     func testInstallAppStopsWhenThePreviousAppCannotBeRemoved() throws {
         let prebuilt = try fx.preparePrebuilt()
@@ -1642,7 +1593,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
         XCTAssertTrue(r.stderr.contains("Install stopped: 'rm -rf' could not remove all of the previous app at \(fx.app.path) (see the error above)."), r.stderr)
         XCTAssertTrue(r.stderr.contains("What is at \(fx.app.path) now may be incomplete and was not verified. It was left as it is."), r.stderr)
-        XCTAssertTrue(r.stderr.contains("\(fx.sudoers.path) is installed; \(fx.installedBackstop.path) and the LaunchAgent were not touched."), r.stderr)
+        XCTAssertTrue(r.stderr.contains("\(fx.installedBackstop.path) and the LaunchAgent were not touched."), r.stderr)
         XCTAssertFalse(r.stderr.contains("Nothing was changed"), r.stderr)
         XCTAssertEqual(try FileManager.default.subpathsOfDirectory(atPath: fx.app.path).sorted(),
                        ["Contents", "Contents/MacOS", "Contents/MacOS/Insomnia"], "only what rm could not remove is left")
@@ -1667,7 +1618,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stderr.contains("Install stopped: could not create \(fx.appsDir.path) (see the error above)."), r.stderr)
         XCTAssertTrue(r.stderr.contains("Nothing was at \(fx.app.path) before."), r.stderr)
         XCTAssertTrue(r.stderr.contains("Nothing is at \(fx.app.path) now."), r.stderr)
-        XCTAssertTrue(r.stderr.contains("\(fx.sudoers.path) is installed; \(fx.installedBackstop.path) and the LaunchAgent were not touched."), r.stderr)
+        XCTAssertTrue(r.stderr.contains("\(fx.installedBackstop.path) and the LaunchAgent were not touched."), r.stderr)
         XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: fx.appsDir.path), gone, "the link is left as it was")
         XCTAssertFalse(FileManager.default.fileExists(atPath: gone))
         assertStoppedInStep3(prebuilt: prebuilt, source: source)
@@ -1693,7 +1644,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stderr.contains("Install stopped: copying \(fx.physicalPath(prebuilt)) to \(fx.app.path) failed (see the error above)."), r.stderr)
         XCTAssertTrue(r.stderr.contains("What was at \(fx.app.path) before was removed first."), r.stderr)
         XCTAssertTrue(r.stderr.contains("What is at \(fx.app.path) now may be incomplete and was not verified. It was left as it is."), r.stderr)
-        XCTAssertTrue(r.stderr.contains("\(fx.sudoers.path) is installed; \(fx.installedBackstop.path) and the LaunchAgent were not touched."), r.stderr)
+        XCTAssertTrue(r.stderr.contains("\(fx.installedBackstop.path) and the LaunchAgent were not touched."), r.stderr)
         var partial = source
         partial["Contents/Resources/AppIcon.icns"] = nil
         XCTAssertEqual(try fx.tree(under: fx.app), partial, "every file but the unreadable one, none of the old app")
@@ -1721,7 +1672,7 @@ final class RecoveryScriptTests: XCTestCase {
         assertStoppedInStep3(prebuilt: prebuilt, source: source)
     }
 
-    /// What every step 3 copy failure leaves: the new sudoers rule, the old
+    /// What every step 3 copy failure leaves: the sudoers rule untouched, the old
     /// backstop.sh and LaunchAgent plist, an unchanged bundle, no copy check
     /// and no launchctl call.
     private func assertStoppedInStep3(prebuilt: URL, source: [String: String], file: StaticString = #filePath, line: UInt = #line) {
@@ -1729,8 +1680,8 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(calls.filter { $0.hasPrefix("codesign") }, ["codesign --verify --strict --deep \(fx.physicalPath(prebuilt))"],
                        "the bundle was checked; no copy was verified", file: file, line: line)
         XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") || $0.hasPrefix("swift") }, "\(calls)", file: file, line: line)
-        XCTAssertTrue((try? String(contentsOf: fx.sudoers, encoding: .utf8))?.contains("NOPASSWD: /usr/bin/pmset") == true,
-                      "the new sudoers rule is installed", file: file, line: line)
+        XCTAssertEqual(try? String(contentsOf: fx.sudoers, encoding: .utf8), "rule",
+                       "the existing sudoers rule is never touched", file: file, line: line)
         XCTAssertEqual(try? String(contentsOf: fx.installedBackstop, encoding: .utf8), "old helper", file: file, line: line)
         XCTAssertEqual(try? String(contentsOf: fx.plist, encoding: .utf8), "plist", file: file, line: line)
         XCTAssertEqual(try? fx.tree(under: prebuilt), source, "the bundle is unchanged", file: file, line: line)
@@ -1989,7 +1940,6 @@ private final class ScriptFixture {
             "LAUNCHCTL": bin.appendingPathComponent("launchctl").path,
             "SUDO": bin.appendingPathComponent("sudo").path,
             "APP": app.path,
-            "SUDOERS": sudoers.path,
             "LOCK_TIMEOUT_SECONDS": "1",
             "QUIT_WAIT_SECONDS": "1",
         ]).write(to: uninstall, atomically: true, encoding: .utf8)
@@ -2003,7 +1953,6 @@ private final class ScriptFixture {
             "APP_SUPPORT": home.path,
             "LOG_DIR": home.appendingPathComponent("Logs").path,
             "LAUNCH_AGENTS": home.appendingPathComponent("LaunchAgents").path,
-            "SUDOERS": sudoers.path,
             "PGREP": bin.appendingPathComponent("pgrep").path,
             "OSASCRIPT": bin.appendingPathComponent("osascript").path,
             "LAUNCHCTL": bin.appendingPathComponent("launchctl").path,
@@ -2013,11 +1962,7 @@ private final class ScriptFixture {
             "SYSCTL": bin.appendingPathComponent("sysctl").path,
             "LOCK_TIMEOUT_SECONDS": "1",
         ])
-        // macOS mktemp without a template can ignore TMPDIR; the sudoers
-        // candidate goes inside the fixture instead.
-        guard !root.path.contains("'") else { throw FixtureError("fixture path contains a quote: \(root.path)") }
-        let patchedInstall = try Self.replaceOnce(patchedConstants, #"TMP_SUDOERS="$(mktemp)""#,
-                                                  with: #"TMP_SUDOERS="$(mktemp '"# + root.path + #"/sudoers.XXXXXXXX')""#)
+        let patchedInstall = patchedConstants
         try patchedInstall.write(to: install, atomically: true, encoding: .utf8)
         // The redirected copy runs past the INSOMNIA_HOME refusal: that
         // variable is what makes the backstop copy it installs act on the

@@ -83,29 +83,6 @@ final class RecoverySafetyTests: XCTestCase {
         XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true)
     }
 
-    /// `lowpowermode 1` completes after the session ended. The mode must not
-    /// stay on outside the journal.
-    func testLowPowerCompletionAfterEndMustNotEscapeJournal() async throws {
-        let gate = AsyncGate()
-        h.guardFake.lowPowerGate = gate
-        let m = h.makeManager()
-        await m.start(duration: 3600)
-
-        let lowPower = Task { await m.setLowPower(true) }
-        await gate.waitUntilStarted()
-        let end = Task { await m.end(reason: .user) }
-        await settleQueuedRequests()
-        await gate.open()
-        let changed = await lowPower.value
-        _ = await end.value
-
-        XCTAssertFalse(changed, "a Low Power change that lands after an end request must not be announced as ours")
-        XCTAssertFalse(h.guardFake.lowPowerOn, "Low Power Mode left on with a clean journal")
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "pmset -g custom", "lowpowermode 1", "disablesleep 0", "lowpowermode 0"])
-        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
-        XCTAssertNil(m.session)
-    }
-
     /// End requested while start's `disablesleep 1` is in flight. After both
     /// finish, sleep must be back to normal and nothing journaled.
     func testEndDuringStartMustNotDisableSleepAfterCleanup() async throws {

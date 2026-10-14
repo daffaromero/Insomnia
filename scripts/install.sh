@@ -1,9 +1,10 @@
 #!/bin/bash
 # Build Insomnia, assemble ~/Applications/Insomnia.app, install the backstop
-# script + LaunchAgent, and write the sudoers rule. Idempotent; asks for sudo
-# once (for /etc/sudoers.d/insomnia), before anything of a previous install
-# is touched. Not atomic: a failure after the sudoers step says exactly what
-# was replaced so far.
+# script + LaunchAgent. Writes no sudoers rule: it only checks, with
+# `sudo -n -l` (no prompt, nothing run), that an existing rule already allows
+# `pmset -a disablesleep 0`, before anything of a previous install is
+# touched. Not atomic: a failure after that check says exactly what was
+# replaced so far.
 #
 #   ./scripts/install.sh                         build from this source checkout
 #   ./scripts/install.sh --app ./Insomnia.app    install a prebuilt bundle (the
@@ -54,7 +55,6 @@ LOG_DIR="$HOME/Library/Logs/Insomnia"
 LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
 LABEL="com.insomnia.backstop"
 PLIST="$LAUNCH_AGENTS/$LABEL.plist"
-SUDOERS=/etc/sudoers.d/insomnia
 UID_NUM="$(id -u)"
 
 step() { printf '\n==> %s\n' "$*"; }
@@ -162,32 +162,18 @@ else
   [[ -x "$BIN" ]] || { echo "binary not found at $BIN" >&2; exit 1; }
 fi
 
-# 2. sudoers -----------------------------------------------------------------
-#    The password prompt comes first: until the rule is installed and proven
-#    effective, the running app is not asked to quit and neither the bundle,
-#    the installed backstop.sh nor the LaunchAgent are touched.
-step "Writing $SUDOERS (requires your password once)"
-TMP_SUDOERS="$(mktemp)"
-trap 'rm -f "$TMP_SUDOERS"' EXIT
-cat > "$TMP_SUDOERS" <<SUDO
-# Installed by Insomnia install.sh. Exactly four commands, nothing else.
-$USER ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1
-$USER ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0
-$USER ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 1
-$USER ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 0
-SUDO
-if "$SUDO" visudo -cf "$TMP_SUDOERS" >/dev/null; then
-  "$SUDO" install -m 0440 -o root -g wheel "$TMP_SUDOERS" "$SUDOERS"
-else
-  echo "sudoers file failed validation (or sudo did not authenticate); not installed. Nothing was changed." >&2
-  exit 1
-fi
-# `sudo -l <command>` checks the rule without running pmset (nothing on the
-# machine changes). The backstop cannot undo anything without it, so stop here.
+# 2. sudoers check -----------------------------------------------------------
+#    No sudoers file is written (some managed Macs deny writes to
+#    /etc/sudoers.d). An existing NOPASSWD rule must already allow
+#    `pmset -a disablesleep 0` and `1`. `sudo -n -l <command>` checks the
+#    rule without running pmset or prompting. The backstop cannot undo
+#    anything without it, so stop here: until it passes, the running app is
+#    not asked to quit and nothing of a previous install is touched.
+step "Checking that sudo allows pmset -a disablesleep without a password"
 if "$SUDO" -n -l /usr/bin/pmset -a disablesleep 0 >/dev/null 2>&1; then
   echo "sudoers rule verified"
 else
-  echo "'sudo -n pmset' is still not permitted; check $SUDOERS. The app, backstop.sh and LaunchAgent were not touched." >&2
+  echo "'sudo -n pmset -a disablesleep 0' is not permitted. A NOPASSWD sudoers rule must allow pmset -a disablesleep 0 and 1 (if yours is only active while you are elevated to admin, elevate first) and rerun. Nothing was changed." >&2
   exit 1
 fi
 
@@ -205,7 +191,7 @@ if "$PGREP" -x Insomnia >/dev/null 2>&1; then
   done
   if "$PGREP" -x Insomnia >/dev/null 2>&1; then
     echo "Insomnia is still running after ${QUIT_WAIT_SECONDS}s (it may be refusing to quit until its own recovery finishes)." >&2
-    echo "Let it finish or quit it from its menu, then rerun. $SUDOERS is installed; the app, backstop.sh and LaunchAgent were not touched." >&2
+    echo "Let it finish or quit it from its menu, then rerun. The app, backstop.sh and LaunchAgent were not touched." >&2
     exit 1
   fi
 fi
@@ -224,7 +210,7 @@ if [[ -n "$PREBUILT" ]]; then
     else
       echo "Nothing is at $APP now." >&2
     fi
-    echo "$SUDOERS is installed; $APP_SUPPORT/backstop.sh and the LaunchAgent were not touched. Fix the error and rerun this script." >&2
+    echo "$APP_SUPPORT/backstop.sh and the LaunchAgent were not touched. Fix the error and rerun this script." >&2
     exit 1
   }
   if [[ -e "$APP" || -L "$APP" ]]; then
@@ -237,7 +223,7 @@ if [[ -n "$PREBUILT" ]]; then
   cp -R "$PREBUILT" "$APP" || copy_failed "copying $PREBUILT to $APP failed" "$before_copy"
   if ! "$CODESIGN" --verify --strict --deep "$APP"; then
     echo "The copy at $APP fails 'codesign --verify --strict --deep' (the previous app there was already removed)." >&2
-    echo "$SUDOERS is installed; backstop.sh and the LaunchAgent were not touched. Rerun this script." >&2
+    echo "backstop.sh and the LaunchAgent were not touched. Rerun this script." >&2
     exit 1
   fi
   echo "installed $PREBUILT as $APP; signature unchanged and verified"
@@ -272,7 +258,7 @@ lock_rc=0
 "$LOCKF" -t "$LOCK_TIMEOUT_SECONDS" 9 2>/dev/null || lock_rc=$?
 if (( lock_rc != 0 )); then
   echo "The recovery lock $LOCK is held by another process (the app or a running backstop)." >&2
-  echo "Wait a minute and rerun. The app, $APP_SUPPORT/backstop.sh and $SUDOERS are installed; the LaunchAgent was not touched." >&2
+  echo "Wait a minute and rerun. The app and $APP_SUPPORT/backstop.sh are installed; the LaunchAgent was not touched." >&2
   exit 75
 fi
 if "$PGREP" -x Insomnia >/dev/null 2>&1; then
@@ -299,7 +285,7 @@ recovery_rc=0
 step "Installing LaunchAgent $LABEL"
 CANDIDATE_DIR="$LAUNCH_AGENTS/.$LABEL.staging"
 CANDIDATE="$CANDIDATE_DIR/$LABEL.candidate-$$.plist"
-trap 'rm -f "$TMP_SUDOERS" "$CANDIDATE"; rmdir "$CANDIDATE_DIR" 2>/dev/null || true' EXIT
+trap 'rm -f "$CANDIDATE"; rmdir "$CANDIDATE_DIR" 2>/dev/null || true' EXIT
 mkdir -p "$CANDIDATE_DIR"
 # Leftovers of earlier attempts, including an older build's candidates in
 # $LAUNCH_AGENTS itself (those make launchd's login load report an error).
@@ -330,7 +316,7 @@ schedule it runs was not verified here; check with 'launchctl print gui/$UID_NUM
 
 Install stopped: the backstop could not fully undo a previous session
 (exit status $recovery_rc). The LaunchAgent was not replaced or unloaded.
-Installed so far: the app at $APP, $APP_SUPPORT/backstop.sh, and $SUDOERS.
+Installed so far: the app at $APP and $APP_SUPPORT/backstop.sh.
 $agent_note
 Check $LOG_DIR/insomnia.log and resolve what it reports (saved audio, display
 brightness or keyboard backlight needs the app: open "$APP"), or run the
@@ -436,7 +422,7 @@ so nothing was reloaded. Check 'launchctl print gui/$UID_NUM/$LABEL' and, if nee
 Install stopped: $reason.
 $plist_note
 $outcome
-The app, $APP_SUPPORT/backstop.sh and $SUDOERS are installed and the recovery
+The app and $APP_SUPPORT/backstop.sh are installed and the recovery
 journal was clean when checked above. Fix the launchctl error and rerun.
 FAIL
   exit 1
